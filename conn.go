@@ -187,37 +187,99 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 // sendPackets handles packet transmission with retries
 func (c *Conn) sendPackets() {
     c.mu.Lock()
-    defer c.mu.Unlock()
-
+    
+    // Create a map to track unacked packets with timestamps
+    unackedPackets := make(map[uint16]*pendingPacket)
+    
+    // Send all packets in buffer
     for i := range c.sendBuffer {
         pkt := &c.sendBuffer[i]
         data := append(pkt.header.Marshal(), pkt.data...)
-
-        for retry := 0; retry < MAX_RETRIES; retry++ {
-            _, err := c.pconn.WriteTo(data, c.remoteAddr)
-            if err != nil {
-                select {
-                case c.errorCh <- err:
-                default:
-                }
-                return
-            }
-
-            // Wait for ACK with timeout
-            timer := time.NewTimer(DEFAULT_TIMEOUT)
+        
+        _, err := c.pconn.WriteTo(data, c.remoteAddr)
+        if err != nil {
+            c.mu.Unlock()
             select {
-            case <-timer.C:
-                // Timeout, retry
-                continue
-            case <-c.closeCh:
-                timer.Stop()
-                return
+            case c.errorCh <- err:
+            default:
             }
+            return
+        }
+        
+        // Track packet for retransmission
+        unackedPackets[pkt.header.SeqNr] = &pendingPacket{
+            packet:    *pkt,
+            data:      data,
+            timestamp: time.Now(),
+            retries:   0,
         }
     }
-
-    // Clear sent packets
-    c.sendBuffer = c.sendBuffer[:0]
+    
+    c.mu.Unlock()
+    
+    // Start retransmission timer
+    ticker := time.NewTicker(DEFAULT_TIMEOUT)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            c.mu.Lock()
+            now := time.Now()
+            
+            // Check for timeouts and retransmit
+            for seqNr, pending := range unackedPackets {
+                if now.Sub(pending.timestamp) >= DEFAULT_TIMEOUT {
+                    if pending.retries >= MAX_RETRIES {
+                        // Max retries reached, give up
+                        delete(unackedPackets, seqNr)
+                        c.mu.Unlock()
+                        select {
+                        case c.errorCh <- errors.New("max retries exceeded"):
+                        default:
+                        }
+                        return
+                    }
+                    
+                    // Retransmit packet
+                    _, err := c.pconn.WriteTo(pending.data, c.remoteAddr)
+                    if err != nil {
+                        c.mu.Unlock()
+                        select {
+                        case c.errorCh <- err:
+                        default:
+                        }
+                        return
+                    }
+                    
+                    pending.timestamp = now
+                    pending.retries++
+                }
+            }
+            
+            // Check if we've received ACKs for all packets
+            if len(unackedPackets) == 0 {
+                // Clear sent packets and exit
+                c.sendBuffer = c.sendBuffer[:0]
+                c.mu.Unlock()
+                return
+            }
+            
+            c.mu.Unlock()
+            
+        case <-c.closeCh:
+            return
+        }
+        
+        // Check for ACKs (this will be handled by processPacket)
+        c.mu.Lock()
+        for seqNr := range unackedPackets {
+            if seqNr <= c.lastAckNr {
+                delete(unackedPackets, seqNr)
+            }
+        }
+        c.mu.Unlock()
+    }
 }
 
 // receiveLoop handles incoming packets
